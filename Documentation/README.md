@@ -103,8 +103,8 @@ After the game ends, the player may:
 - Arcade button (power toggle)  
 - Piezo buzzer  
 - NeoPixel RGB LED  
-- Breadboard or perfboard  
-- Optional LiPo battery and switch
+- Perfboard  
+- LiPo battery
 
 ---
 
@@ -161,26 +161,4 @@ High-contrast text UI showing:
 - Animated splash screen  
 - Modular, maintainable codebase  
 - Runs on compact, low-power embedded hardware  
-
----
-
-## Possible Extensions
-
-- Animated icons or visual prompts  
-- Combo scoring system  
-- Additional move types  
-- Multiplayer or pass-and-play mode  
-- Battery monitoring and low-power modes  
-
----
-
-If you want, I can generate:
-
-- A **system block diagram**  
-- A **wiring diagram** for your exact setup  
-- A **bill of materials (BOM)**  
-- A **project report** version for MSTI  
-- A **visual banner** for the top of the README
-
-Just tell me!
 
