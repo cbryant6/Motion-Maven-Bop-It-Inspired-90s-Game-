@@ -1,0 +1,90 @@
+                        ┌────────────────────────────────────────────┐
+                        │                POWER SYSTEM                 │
+                        │────────────────────────────────────────────│
+                        │ USB 5V → 3V3 Regulator (on XIAO ESP32-C3)  │
+                        │ Arcade Button → Power Toggle Logic          │
+                        └─────────────────────────────┬──────────────┘
+                                                      │ 3V3 / GND
+                                                      ▼
+
+        ┌────────────────────────────────────────────────────────────────┐
+        │                         XIAO ESP32-C3 MCU                      │
+        │────────────────────────────────────────────────────────────────│
+        │ • RISC-V CPU (game loop, logic, state machine)                 │
+        │ • I²C Master (for ADXL345 + OLED)                              │
+        │ • GPIO Digital Inputs (buttons, rotary A/B)                    │
+        │ • PWM Output (piezo audio)                                     │
+        │ • WS2812 Driver (NeoPixel)                                     │
+        │ • Internal Flash (high score storage)                          │
+        └───────────────┬───────────────┬───────────────┬──────────────┘
+                        │               │               │
+                        │               │               │
+              (Digital Inputs)    (I²C Bus)       (Digital Output)
+                        │               │               │
+                        ▼               ▼               ▼
+
+        ┌──────────────────────┐      ┌──────────────────────────────┐
+        │ Rotary Encoder A/B   │      │          I²C BUS              │
+        │ CLK → D2             │──────│ SDA → D4                      │
+        │ DT  → D3             │      │ SCL → D5                      │
+        │ Mechanical Gray Code │      │ Shared between peripherals     │
+        └──────────┬───────────┘      └───────────┬──────────────────┘
+                   │                              │
+                   │ (Digital Input Signals)      │ (SDA/SCL)
+                   ▼                              ▼
+
+     ┌──────────────────────────┐         ┌───────────────────────────────┐
+     │ Rotary Encoder Button    │         │   ADXL345 Accelerometer       │
+     │ ENC_BTN → D9             │         │   (Motion Sensing IC)         │
+     │ Pull-up Input            │         │───────────────────────────────│
+     │ User Confirms / Selects  │         │ • 3-axis acceleration sensing │
+     └──────────┬──────────────┘         │ • Tilt / Shake detection      │
+                │                        │ • Provides raw X/Y/Z over I²C │
+                │                        └───────────────┬───────────────┘
+                │                                        │
+                │                                        │ (I²C)
+                ▼                                        ▼
+
+        ┌─────────────────────┐              ┌─────────────────────────────┐
+        │  Arcade Button      │              │      SSD1306 OLED            │
+        │  BUTTON → D10       │──────────────│      128×64 Display          │
+        │  Active-Low Input   │              │──────────────────────────────│
+        │  Powers Game Logic  │              │ • Menu UI                    │
+        └────────────┬────────┘              │ • Round display              │
+                     │                       │ • Feedback messages          │
+                     │                       └────────────┬────────────────┘
+                     │                                    │
+                     ▼                                    │
+          (Digital Trigger)                               │ (I²C DisplayIO)
+                                                          ▼
+
+                                 ┌─────────────────────────────┐
+                                 │     Piezo Buzzer (PWM)      │
+                                 │─────────────────────────────│
+                                 │ • Startup jingle            │
+                                 │ • Success / Fail tones      │
+                                 │ • Victory melody            │
+                                 └──────────────┬──────────────┘
+                                                │ PWM Output
+                                                ▼
+
+                                 ┌─────────────────────────────┐
+                                 │      NeoPixel RGB LED       │
+                                 │─────────────────────────────│
+                                 │ • Blue: Menu                │
+                                 │ • Yellow: Gameplay          │
+                                 │ • Green: Success            │
+                                 │ • Red: Failure              │
+                                 └──────────────┬──────────────┘
+                                                │ WS2812 Data
+                                                ▼
+
+                     ┌─────────────────────────────────────────────────┐
+                     │                SOFTWARE STACK                   │
+                     │─────────────────────────────────────────────────│
+                     │  code.py: State Machine + Game Logic            │
+                     │  motion.py: Calibration, Tilt, Shake Filtering  │
+                     │  audio.py: Sound Effects (PWM driver)           │
+                     │  highscores.py: Flash Storage Manager           │
+                     │  displayio UI + Label Rendering                 │
+                     └─────────────────────────────────────────────────┘
