@@ -1,0 +1,738 @@
+import time
+import random
+import board
+import digitalio
+import displayio
+import terminalio
+import neopixel
+
+from adafruit_display_text import label
+import i2cdisplaybus
+import adafruit_displayio_ssd1306
+import adafruit_adxl34x
+
+import highscores as hs
+import audio as snd          # piezo sounds
+import motion as mv          # NEW: motion module
+
+
+# =====================================================================
+#   SOFTWARE ROTARY ENCODER
+# =====================================================================
+
+class SoftEncoder:
+    """
+    Simple software rotary encoder.
+    - Uses falling edges on A and B to decide direction.
+    """
+
+    def __init__(self, pinA, pinB):
+        self.pinA = digitalio.DigitalInOut(pinA)
+        self.pinB = digitalio.DigitalInOut(pinB)
+
+        self.pinA.direction = digitalio.Direction.INPUT
+        self.pinB.direction = digitalio.Direction.INPUT
+        self.pinA.pull = digitalio.Pull.UP
+        self.pinB.pull = digitalio.Pull.UP
+
+        self.last_state = (self.pinA.value, self.pinB.value)
+        self.position = 0
+
+    def update(self):
+        a, b = self.pinA.value, self.pinB.value
+        last_a, last_b = self.last_state
+
+        if (a, b) != self.last_state:
+            # Falling edge on A
+            if last_a == 1 and a == 0:
+                if b == 1:
+                    self.position += 1
+                else:
+                    self.position -= 1
+
+            # Falling edge on B
+            elif last_b == 1 and b == 0:
+                if a == 0:
+                    self.position += 1
+                else:
+                    self.position -= 1
+
+        self.last_state = (a, b)
+
+
+# =====================================================================
+#   PIN DEFINITIONS
+# =====================================================================
+
+PIXEL_PIN = board.D6          # NeoPixel
+BUTTON_PIN = board.D10        # Main arcade button (POWER TOGGLE)
+ENC_A_PIN = board.D2          # Rotary encoder A (CLK)
+ENC_B_PIN = board.D3          # Rotary encoder B (DT)
+ENC_BTN_PIN = board.D9        # Encoder push button (MENU SELECT + GAME OVER ACK)
+# Buzzer handled inside audio.py (D7)
+
+
+# =====================================================================
+#   GAME STATE CONSTANTS & GLOBALS
+# =====================================================================
+
+STATE_MENU = "MENU"
+STATE_PLAY = "PLAY"
+STATE_RESULT = "RESULT"
+STATE_HS_ENTRY = "HS_ENTRY"
+STATE_HS_SHOW = "HS_SHOW"
+
+# Power management
+is_powered_on = False          # Start "off" until power button is pressed
+game_state = STATE_MENU
+
+# Splash screen flag (per device boot/reset)
+splash_shown = False
+
+# Difficulty settings
+DIFFICULTIES = ["EASY", "MEDIUM", "HARD"]
+DIFFICULTY_TIMES = {
+    "EASY": 7.0,   # base time per move
+    "MEDIUM": 5.0,
+    "HARD": 3.0
+}
+current_difficulty_index = 0
+current_difficulty = DIFFICULTIES[current_difficulty_index]
+
+# Base time limit for current difficulty (we shrink it per round)
+base_time_limit = DIFFICULTY_TIMES[current_difficulty]
+
+# Max rounds per game
+MAX_ROUNDS = 11
+
+# Menu: 0 = Start Game, 1 = Difficulty, 2 = Recalibrate
+menu_index = 0
+MENU_MAX_INDEX = 2
+last_enc_pos = 0
+
+# Gameplay state
+play_start = None
+play_move = None       # dict describing current challenge
+play_result = ""
+
+# Scoring/rounds
+score = 0
+round_num = 1
+pending_score = 0      # score at end of game (for highscores)
+
+# Button edge detection
+prev_button_value = True       # arcade button
+prev_enc_btn_value = True      # encoder button
+
+# Rotary spin tracking (for spin moves)
+SPIN_REQUIRED_STEPS = 1   # require only 1 detent for spin (more responsive)
+move_start_enc_pos = 0
+
+# All possible moves (full set)
+MOVES_ALL = [
+    {"type": "TILT", "direction": "LEFT",    "label": "Tilt LEFT"},
+    {"type": "TILT", "direction": "RIGHT",   "label": "Tilt RIGHT"},
+    {"type": "TILT", "direction": "FORWARD", "label": "Tilt FORWARD"},
+    {"type": "TILT", "direction": "BACK",    "label": "Tilt BACK"},
+    {"type": "SPIN", "direction": "CW",      "label": "Spin CW"},
+    {"type": "SPIN", "direction": "CCW",     "label": "Spin CCW"},
+    {"type": "SHAKE","direction": None,      "label": "Shake!"}
+]
+
+# Easy-mode moves: only spins + shake
+MOVES_EASY = [
+    {"type": "SPIN", "direction": "CW",      "label": "Spin CW"},
+    {"type": "SPIN", "direction": "CCW",     "label": "Spin CCW"},
+    {"type": "SHAKE","direction": None,      "label": "Shake!"}
+]
+
+# Highscore entry UI state (stays in this file)
+hs_initials = ["A", "A", "A"]
+hs_pos = 0
+hs_last_enc_pos = 0
+
+# This will hold the list returned by hs.load_highscores()
+highscores = []
+
+
+# =====================================================================
+#   OLED TEXT RENDERING FUNCTION
+# =====================================================================
+
+def show_text(lines):
+    group = displayio.Group()
+    y = 8
+
+    for text in lines:
+        lbl = label.Label(
+            terminalio.FONT,
+            text=text,
+            color=0xFFFFFF,
+            x=0,
+            y=y
+        )
+        group.append(lbl)
+        y += 12
+
+    display.root_group = group
+
+
+def clear_display():
+    """Helper to clear screen when powered off"""
+    display.root_group = displayio.Group()
+
+
+# =====================================================================
+#   HELPER: SPLASH SCREEN ANIMATION (BIG MOTION MAVEN)
+# =====================================================================
+
+def play_splash():
+    """
+    Animated splash: big 'MOTION MAVEN' in an arcade-ish style.
+    Plays every time power is turned ON.
+    """
+    global splash_shown
+
+    group = displayio.Group()
+    display.root_group = group
+
+    title = "MOTION MAVEN"
+
+    # Big, scaled text
+    text_area = label.Label(
+        terminalio.FONT,
+        text="",
+        color=0xFFFFFF,
+        x=0,      # we'll center it dynamically
+        y=32,     # vertical center-ish on 64px screen
+        scale=2   # bigger for arcade feel
+    )
+    group.append(text_area)
+
+    # Typewriter animation with centering
+    for i in range(len(title) + 1):
+        partial = title[:i]
+        text_area.text = partial
+
+        # Approximate width: ~6px per character * scale
+        text_width = len(partial) * 6 * text_area.scale
+        text_area.x = (128 - text_width) // 2  # center on 128px width
+
+        time.sleep(0.08)
+
+    splash_shown = True
+
+
+# =====================================================================
+#   MOVE PICKER
+# =====================================================================
+
+def pick_new_move(previous_move, moves_pool):
+    """
+    Pick a new move from the given pool, avoiding repeating the same label twice.
+    """
+    if previous_move is None:
+        return random.choice(moves_pool)
+    prev_label = previous_move["label"]
+    candidates = [m for m in moves_pool if m["label"] != prev_label]
+    if not candidates:
+        return previous_move
+    return random.choice(candidates)
+
+
+# =====================================================================
+#   RECALIBRATION MODE (WITH LIVE TILT VIEW, USING motion.py)
+# =====================================================================
+
+def do_recalibration():
+    """
+    Recalibration screen:
+      - Shows live tilt direction (using motion.get_stable_tilt_label)
+      - Shows raw X/Y/Z
+      - Waits for encoder button press to actually calibrate
+    """
+    global prev_enc_btn_value
+
+    pixels[0] = (0, 0, 50)  # blue-ish
+
+    # Use a local prev value so we don't fight with main loop
+    local_prev = enc_button.value
+
+    while True:
+        x, y, z = accel.acceleration
+        tilt_label, raw_label = mv.get_stable_tilt_label(x, y, z)
+
+        show_text([
+            "Recalibration Mode",
+            f"Tilt: {tilt_label}",
+            f"X:{x:5.1f}  Y:{y:5.1f}",
+            f"Z:{z:5.1f}",
+            "",
+            "Enc: Calibrate"
+        ])
+
+        current = enc_button.value
+        pressed = (local_prev and not current)
+        local_prev = current
+
+        if pressed:
+            break
+
+        time.sleep(0.1)
+
+    # Perform actual calibration after user presses encoder
+    show_text([
+        "Hold neutral...",
+        "Calibrating..."
+    ])
+    time.sleep(0.5)
+
+    mv.calibrate(accel)
+    mv.reset_smoothing()
+
+    show_text([
+        "Calibration OK",
+        "",
+        "Returning to menu..."
+    ])
+    time.sleep(0.8)
+
+    # Resync main loop's prev_enc_btn_value so it doesn't mis-detect
+    prev_enc_btn_value = enc_button.value
+    pixels[0] = (0, 0, 50)
+
+
+# =====================================================================
+#   INITIALIZE I2C, OLED, ACCELEROMETER
+# =====================================================================
+
+i2c = board.I2C()
+
+displayio.release_displays()
+display_bus = i2cdisplaybus.I2CDisplayBus(i2c, device_address=0x3C)
+
+display = adafruit_displayio_ssd1306.SSD1306(
+    display_bus,
+    width=128,
+    height=64
+)
+
+accel = adafruit_adxl34x.ADXL345(i2c)
+
+
+# =====================================================================
+#   NEOPIXEL
+# =====================================================================
+
+pixels = neopixel.NeoPixel(PIXEL_PIN, 1, brightness=0.35, auto_write=True)
+pixels[0] = (0, 0, 0)
+
+
+# =====================================================================
+#   BUTTONS
+# =====================================================================
+
+# Main Arcade Button (Power Toggle)
+button = digitalio.DigitalInOut(BUTTON_PIN)
+button.direction = digitalio.Direction.INPUT
+button.pull = digitalio.Pull.UP   # active low
+
+# Encoder push button (MENU SELECT + GAME OVER ACK)
+enc_button = digitalio.DigitalInOut(ENC_BTN_PIN)
+enc_button.direction = digitalio.Direction.INPUT
+enc_button.pull = digitalio.Pull.UP
+
+
+# =====================================================================
+#   ROTARY ENCODER INSTANCE
+# =====================================================================
+
+encoder = SoftEncoder(ENC_A_PIN, ENC_B_PIN)
+
+# Load highscores from onboard storage via module
+highscores = hs.load_highscores()
+
+
+# =====================================================================
+#   MAIN LOOP
+# =====================================================================
+
+while True:
+    now = time.monotonic()
+
+    # --- 1. ALWAYS READ ARCADE BUTTON (POWER) ---
+    current_button_value = button.value
+    # Detect falling edge (Pressed)
+    if prev_button_value and not current_button_value:
+        # Toggle desired power state
+        is_powered_on = not is_powered_on
+
+        if is_powered_on:
+            # Just turned ON via power button
+            pixels[0] = (0, 0, 50)  # Blue-ish
+
+            # Splash + startup jingle
+            play_splash()
+            snd.play_startup()
+
+            # First time after boot: auto-calibrate if needed
+            if not mv.is_calibrated():
+                show_text([
+                    "Motion Maven",
+                    "Hold neutral...",
+                    "Calibrating..."
+                ])
+                time.sleep(0.5)
+
+                mv.calibrate(accel)
+                mv.reset_smoothing()
+
+                show_text([
+                    "Motion Maven",
+                    "Calibration OK",
+                    "",
+                    "Rotate to Start"
+                ])
+                time.sleep(0.8)
+
+            # After splash (and optional calibration), go to menu
+            game_state = STATE_MENU
+            menu_index = 0
+            last_enc_pos = encoder.position
+
+        else:
+            # Just turned OFF via power button
+            pixels[0] = (0, 0, 0)  # Turn off light
+            clear_display()        # Turn off screen
+
+    prev_button_value = current_button_value
+
+    # --- 2. IF POWERED OFF, SLEEP AND SKIP LOGIC ---
+    if not is_powered_on:
+        time.sleep(0.1)  # Sleep to save cycles
+        continue         # Skip the rest of the loop
+
+    # --- 3. NORMAL GAMEPLAY / UI LOGIC (Run only if On) ---
+    x, y, z = accel.acceleration
+    encoder.update()
+    enc_pos = encoder.position
+
+    # Track encoder delta since move started (for spins)
+    delta = enc_pos - move_start_enc_pos if play_start is not None else 0
+
+    # Smoothed tilt & raw tilt (for gameplay)
+    tilt_label, raw_tilt = mv.get_stable_tilt_label(x, y, z)
+
+    # Shake detection
+    shaking = mv.detect_shake(x, y, z)
+
+    # Encoder button edge detect
+    current_enc_btn_value = enc_button.value
+    enc_button_pressed = (prev_enc_btn_value and not current_enc_btn_value)
+    prev_enc_btn_value = current_enc_btn_value
+
+    # -----------------------------------------------------------------
+    #   STATE MACHINE
+    # -----------------------------------------------------------------
+
+    if game_state == STATE_MENU:
+        # Encoder changes menu_index between 0,1,2
+        if enc_pos > last_enc_pos:
+            menu_index = min(menu_index + 1, MENU_MAX_INDEX)
+        elif enc_pos < last_enc_pos:
+            menu_index = max(menu_index - 1, 0)
+        last_enc_pos = enc_pos
+
+        arrow0 = ">" if menu_index == 0 else " "
+        arrow1 = ">" if menu_index == 1 else " "
+        arrow2 = ">" if menu_index == 2 else " "
+
+        show_text([
+            "Motion Maven",
+            f"{arrow0} Start Game",
+            f"{arrow1} Difficulty: {current_difficulty}",
+            f"{arrow2} Recalibrate",
+            "",
+            "Enc btn = select"
+        ])
+
+        # Handle menu select with encoder button
+        if enc_button_pressed:
+            if menu_index == 0:
+                # Start game with selected difficulty
+                base_time_limit = DIFFICULTY_TIMES[current_difficulty]
+
+                # Choose which move pool to use
+                if current_difficulty == "EASY":
+                    move_pool = MOVES_EASY
+                else:
+                    move_pool = MOVES_ALL
+
+                game_state = STATE_PLAY
+                score = 0
+                round_num = 1
+                play_start = None
+                play_result = ""
+                pending_score = 0
+                play_move = pick_new_move(None, move_pool)
+                move_start_enc_pos = encoder.position
+                pixels[0] = (50, 50, 0)  # yellow-ish in play state
+
+            elif menu_index == 1:
+                # Cycle difficulty AND show confirmation
+                current_difficulty_index = (current_difficulty_index + 1) % len(DIFFICULTIES)
+                current_difficulty = DIFFICULTIES[current_difficulty_index]
+
+                show_text([
+                    "Difficulty set to:",
+                    f"   {current_difficulty}",
+                    "",
+                    "Enc btn: start",
+                    "or rotate for menu"
+                ])
+                time.sleep(0.7)
+
+                # Bounce cursor back to Start Game so it's obvious
+                menu_index = 0
+                last_enc_pos = enc_pos
+
+            elif menu_index == 2:
+                # Recalibrate with live tilt display
+                do_recalibration()
+                game_state = STATE_MENU
+                pixels[0] = (0, 0, 50)
+
+    elif game_state == STATE_PLAY:
+        if play_start is None:
+            play_start = now
+            move_start_enc_pos = encoder.position
+            delta = 0
+
+        elapsed = now - play_start
+
+        # Dynamic time limit: base minus 0.1s per completed round
+        # Round 1 → base_time_limit
+        # Round 11 → base_time_limit - 1.0
+        time_limit = base_time_limit - 0.1 * (round_num - 1)
+        if time_limit < 0.5:
+            time_limit = 0.5  # hard floor so it never becomes impossible
+
+        # --- Draw main gameplay screen ---
+        show_text([
+            f"Round {round_num}/{MAX_ROUNDS}",
+            f"Diff: {current_difficulty}",
+            f"Target: {play_move['label']}",
+            f"Time:  {elapsed:4.1f}s",
+            f"Score: {score}"
+        ])
+
+        move_type = play_move["type"]
+        success = False
+        fail = False
+
+        # ----------------- TILT MOVE LOGIC -----------------
+        if move_type == "TILT":
+            target_dir = play_move["direction"]
+
+            # Correct move (only if stable tilt says so)
+            if tilt_label == target_dir:
+                success = True
+            else:
+                # Wrong if we have a confirmed *different* direction
+                if tilt_label in ("LEFT", "RIGHT", "FORWARD", "BACK") and tilt_label != target_dir:
+                    fail = True
+                elif abs(delta) >= SPIN_REQUIRED_STEPS:
+                    fail = True
+                elif shaking:
+                    fail = True
+
+        # ----------------- SPIN MOVE LOGIC -----------------
+        elif move_type == "SPIN":
+            # Spin CW / CCW based on encoder delta
+            if play_move["direction"] == "CW":
+                if delta >= SPIN_REQUIRED_STEPS:
+                    success = True
+                elif delta <= -SPIN_REQUIRED_STEPS:
+                    fail = True  # spun the wrong way
+            else:  # CCW
+                if delta <= -SPIN_REQUIRED_STEPS:
+                    success = True
+                elif delta >= SPIN_REQUIRED_STEPS:
+                    fail = True  # wrong way
+
+            # If not already success/fail, big tilt or shake counts as wrong
+            if not success and not fail:
+                if tilt_label in ("LEFT", "RIGHT", "FORWARD", "BACK") or shaking:
+                    fail = True
+
+        # ----------------- SHAKE MOVE LOGIC -----------------
+        elif move_type == "SHAKE":
+            if shaking:
+                success = True
+            # Spinning instead of shaking is wrong
+            elif abs(delta) >= SPIN_REQUIRED_STEPS:
+                fail = True
+
+        # ✅ SUCCESS: auto-advance (or complete game)
+        if success:
+            # Speed-based scoring:
+            # - Always 100 base points
+            # - Bonus up to +200 depending on how much of the time window is left
+            remaining = max(0.0, time_limit - elapsed)
+            if time_limit > 0:
+                ratio = remaining / time_limit   # 0.0 → 1.0
+            else:
+                ratio = 0.0
+            bonus = int(200 * ratio)
+            score += 100 + bonus
+
+            pixels[0] = (0, 120, 0)  # green
+            snd.play_success()
+            show_text([
+                f"Round {round_num}/{MAX_ROUNDS}",
+                "SUCCESS!",
+                "",
+                f"Score: {score}",
+                "Next..."
+            ])
+            time.sleep(0.5)
+
+            # If we've reached the max round, game is complete
+            if round_num >= MAX_ROUNDS:
+                play_result = "ALL ROUNDS CLEARED!"
+                pending_score = score
+                game_state = STATE_RESULT
+                pixels[0] = (0, 120, 0)  # keep green for win
+                snd.play_victory()
+            else:
+                # Setup next round
+                round_num += 1
+
+                # Decide move pool again based on difficulty
+                if current_difficulty == "EASY":
+                    move_pool = MOVES_EASY
+                else:
+                    move_pool = MOVES_ALL
+
+                play_start = None
+                play_move = pick_new_move(play_move, move_pool)
+                move_start_enc_pos = encoder.position
+                play_result = ""
+                pixels[0] = (50, 50, 0)  # back to play color
+
+            continue
+
+        # ❌ FAIL: explicit wrong move
+        if fail:
+            play_result = "WRONG MOVE!"
+            pending_score = score
+            game_state = STATE_RESULT
+            pixels[0] = (120, 0, 0)    # red on game over
+            snd.play_fail()
+
+        # ❌ FAIL: timeout
+        elif elapsed > time_limit:
+            play_result = "TIME UP!"
+            pending_score = score
+            game_state = STATE_RESULT
+            pixels[0] = (120, 0, 0)    # red on game over
+            snd.play_fail()
+
+    elif game_state == STATE_RESULT:
+        # Show final result + score, then go to highscores
+        show_text([
+            f"Rounds: {round_num}/{MAX_ROUNDS}",
+            f"{play_result}",
+            "",
+            f"Score: {pending_score}",
+            "Enc btn: continue"
+        ])
+
+        if enc_button_pressed:
+            # Decide if this is a new highscore
+            if hs.qualifies_for_highscore(highscores, pending_score):
+                # Prepare initials entry
+                hs_initials = ["A", "A", "A"]
+                hs_pos = 0
+                hs_last_enc_pos = encoder.position
+                game_state = STATE_HS_ENTRY
+            else:
+                # Just show highscore table
+                game_state = STATE_HS_SHOW
+
+    elif game_state == STATE_HS_ENTRY:
+        # Initials entry: scroll A-Z for each letter, press to confirm
+        current_pos = encoder.position
+
+        # Rotate encoder to change current character
+        if current_pos > hs_last_enc_pos:
+            # Next letter
+            idx = ord(hs_initials[hs_pos]) - ord('A')
+            idx = (idx + 1) % 26
+            hs_initials[hs_pos] = chr(ord('A') + idx)
+        elif current_pos < hs_last_enc_pos:
+            # Previous letter
+            idx = ord(hs_initials[hs_pos]) - ord('A')
+            idx = (idx - 1) % 26
+            hs_initials[hs_pos] = chr(ord('A') + idx)
+
+        hs_last_enc_pos = current_pos
+
+        # Build display line with brackets around current position
+        c0, c1, c2 = hs_initials
+        if hs_pos == 0:
+            line = f"[{c0}] {c1} {c2}"
+        elif hs_pos == 1:
+            line = f"{c0} [{c1}] {c2}"
+        else:
+            line = f"{c0} {c1} [{c2}]"
+
+        show_text([
+            "NEW HIGH SCORE!",
+            f"Score: {pending_score}",
+            "",
+            "Enter Initials:",
+            line,
+            "Enc: next letter"
+        ])
+
+        if enc_button_pressed:
+            if hs_pos < 2:
+                hs_pos += 1
+            else:
+                initials = "".join(hs_initials)
+                highscores = hs.insert_highscore(highscores, initials, pending_score)
+                hs.save_highscores(highscores)
+                game_state = STATE_HS_SHOW
+
+    elif game_state == STATE_HS_SHOW:
+        # Show highscore table, then return to menu
+        lines = ["HIGH SCORES"]
+        for idx, entry in enumerate(highscores[:3], start=1):
+            # e.g. "1. ABC  1234"
+            lines.append(f"{idx}. {entry['initials']} {entry['score']}")
+        lines.append("")
+        lines.append("Enc btn: menu")
+
+        show_text(lines)
+
+        if enc_button_pressed:
+            game_state = STATE_MENU
+            menu_index = 0
+            last_enc_pos = enc_pos
+            pixels[0] = (0, 0, 50)  # dim blue
+
+    else:
+        # Failsafe fallback: go back to menu
+        game_state = STATE_MENU
+        menu_index = 0
+        last_enc_pos = enc_pos
+        show_text([
+            "Motion Maven",
+            "Resetting..."
+        ])
+        pixels[0] = (50, 0, 0)
+
+    # Fast loop so encoder + tilt both feel responsive
+    time.sleep(0.01)
+ 
