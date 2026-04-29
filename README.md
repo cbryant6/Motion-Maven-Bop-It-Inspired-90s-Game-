@@ -6,6 +6,9 @@ It runs on a Seeed Studio **XIAO ESP32-C3** and features a **128×64 OLED**,
 and **piezo speaker**. The player performs physical gestures—tilts, spins,  
 and shakes—within shrinking time limits as difficulty increases.
 
+<img width="1008" height="1182" alt="image" src="https://github.com/user-attachments/assets/ef5d6eef-c1f7-430c-85f7-18cff17b3afe" />
+
+
 ---
 
 ## How the Game Works
